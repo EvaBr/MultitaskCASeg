@@ -3,6 +3,7 @@
 # It keeps the original segmentation architecture by using get_network_from_plans(...)
 # and wraps it to produce (seg_logits, cls_logits) during training.
 
+from operator import itemgetter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +13,44 @@ import numpy as np
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
+import os
+from typing import List, Union, Type, Tuple
+import numpy as np
+import pandas as pd
+import shutil
+
+from batchgenerators.utilities.file_and_folder_operations import join, load_pickle, isfile, write_pickle, subfiles
+from nnunetv2.configuration import default_num_processes
+from nnunetv2.training.dataloading.utils import unpack_dataset
+from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetNumpy
+
+class nnUNetDatasetCAS(nnUNetDatasetNumpy):
+    """ Dataset for the Multitask nnUNet with CASeg functionality.
+        Returns data, seg, CLASS, seg_prev, properties where seg_prev is the segmentation from the previous stage (or None).
+        For loading preprocessed data + class labels.
+    """
+    def __init__(self, folder: str, identifiers: List[str] = None,
+                 folder_with_segs_from_previous_stage: str = None):
+        super().__init__(folder, identifiers, folder_with_segs_from_previous_stage)
+        self.class_labels = None 
+
+    def set_class_labels(self, rawfolder: str):
+        csv = pd.read_csv(join(rawfolder, 'class_labels.csv'))
+        csv.set_index('case_id', inplace=True)
+        class_dict = dict()
+        for idx, row in csv.iterrows():
+            class_dict[idx] = row['class_label']
+        self.class_labels = class_dict
+        #self.class_labels = np.load(join(rawfolder, 'class_labels.npy'), allow_pickle=True).item()
+
+    def load_case(self, identifier):
+        img_file = super(nnUNetDatasetNumpy, self).load_case(identifier)
+        if self.class_labels is None:
+            return img_file #for compatibility with the  framework; first time this is called before set_class_labels (just to figure out sizes or sth?)
+        class_label = self.class_labels[identifier]
+        return img_file, class_label
+
 
 
 class SegmentationWithImageClassifier(nn.Module):
@@ -146,6 +185,11 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
         # call parent initialize which will call our build_network_architecture above
         super().initialize()
 
+    def get_training_transforms(self):
+        # use parent's transforms
+        return ComposeTransforms(itemgetter(0), super().get_training_transforms()) #the first thing is image, so only do transforms on that
+    def get_validation_transforms(self):
+        return ComposeTransforms(itemgetter(0), super().get_validation_transforms())
 
 #TODO: 
 #other versions
