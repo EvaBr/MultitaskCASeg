@@ -51,6 +51,20 @@ class nnUNetDatasetCAS(nnUNetDatasetNumpy):
         class_label = self.class_labels[identifier]
         return img_file, class_label
 
+    #check if preprocessing (the one that uses save_case) uses this or hte block2 dataset... Is it possile to use the block2 one for the preprocessing only?
+
+    @staticmethod
+    def save_seg(
+            seg: Union[np.ndarray,List[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]], #check; is output for segm a number or a ndarray too?
+            output_filename_truncated: str
+    ):
+        if isinstance(seg, (list, tuple)):
+            #we have also class output
+            segm, class_logits = seg
+            np.savez_compressed(output_filename_truncated + '.npz', seg=segm, class_logits=class_logits)
+        else:
+            np.savez_compressed(output_filename_truncated + '.npz', seg=seg)
+
 
 
 class SegmentationWithImageClassifier(nn.Module):
