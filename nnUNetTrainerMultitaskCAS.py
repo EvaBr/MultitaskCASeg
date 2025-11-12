@@ -2,48 +2,256 @@
 # This file defines a trainer with an additional classification head.
 # It keeps the original segmentation architecture by using get_network_from_plans(...)
 # and wraps it to produce (seg_logits, cls_logits) during training.
-
+import multiprocessing
+from pathlib import Path
+import warnings
+import itertools
 from operator import itemgetter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import distributed as dist
 from torch import autocast
-from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from typing import Any, Tuple, List, Union
 import numpy as np
 import pandas as pd
-from time import time
-from nnunet2.utilities.collate_outputs import collate_outputs
-from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
-from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
-from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
-from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
-from batchgenerators.utilities.file_and_folder_operations import join
+from time import time, sleep
+from queue import Queue
+from threading import Thread
+from tqdm import tqdm
+
+from acvl_utils.cropping_and_padding.padding import pad_nd_image
+from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
 from threadpoolctl import threadpool_limits
 
+from nnunet2.utilities.collate_outputs import collate_outputs
+from nnunetv2.utilities.helpers import empty_cache, dummy_context
+from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
+from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot
+from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 
-from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
-
-
-from batchgenerators.utilities.file_and_folder_operations import join, load_pickle, isfile, write_pickle, subfiles
-from nnunetv2.configuration import default_num_processes
-from nnunetv2.training.dataloading.utils import unpack_dataset
-from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetNumpy
+from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetNumpy, infer_dataset_class
 from nnunetv2.training.dataloading.nnunet_dataloader import nnUNetDataLoader
+
+from batchgenerators.utilities.file_and_folder_operations import join, load_json, maybe_mkdir_p, save_pickle
+from nnunetv2.configuration import default_num_processes
+
+from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
+from nnunetv2.inference.export_prediction import resample_and_save, convert_predicted_logits_to_segmentation_with_correct_shape
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.sliding_window_prediction import compute_gaussian
+from nnunetv2.paths import nnUNet_preprocessed
+
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
+from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
+
+#nnunetpredictor:
+#predict_logits_from_preprocessed_data: prediction += self.predict_sliding_window_return_logits(data)
+
+#these three are urgent for the training to work! The rest are important for inference standalone
+#_internal_maybe_mirror_and_predict: prediction+=self.network(data)...
+#_internal_predict_sliding_window_return_logits: prediction = _internal_maybe_mirror_and_predict(...)
+#predict_sliding_window_return_logits: predicted_logits=_internal_predict_sliding_window_return_logits
+
+#predict_from_files_sequential: prediction = predict_logits_from_preprocessed_data(...)
+#predict_from_data_iterator: prediction = predict_logits_from_preprocessed_data(...)
+
+class MynnUNetPredictor(nnUNetPredictor):
+    @torch.inference_mode()
+    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+        mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+        prediction, class_prediction = self.network(x)
+
+        if mirror_axes is not None:
+            # check for invalid numbers in mirror_axes
+            # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
+            assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
+
+            mirror_axes = [m + 2 for m in mirror_axes]
+            axes_combinations = [
+                c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
+            ]
+            for axes in axes_combinations:
+                prediction += torch.flip(self.network(torch.flip(x, axes))[0], axes)
+            prediction /= (len(axes_combinations) + 1)
+        return prediction, class_prediction
+    
+    @torch.inference_mode()
+    def _internal_predict_sliding_window_return_logits(self,
+                                                       data: torch.Tensor,
+                                                       slicers,
+                                                       do_on_device: bool = True,
+                                                       ):
+        predicted_logits = n_predictions = prediction = gaussian = workon = None
+        results_device = self.device if do_on_device else torch.device('cpu')
+
+        def producer(d, slh, q):
+            for s in slh:
+                q.put((torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device), s))
+            q.put('end')
+
+        try:
+            empty_cache(self.device)
+
+            # move data to device
+            if self.verbose:
+                print(f'move image to device {results_device}')
+            data = data.to(results_device)
+            queue = Queue(maxsize=2)
+            t = Thread(target=producer, args=(data, slicers, queue))
+            t.start()
+
+            # preallocate arrays
+            if self.verbose:
+                print(f'preallocating results arrays on device {results_device}')
+            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+                                           dtype=torch.half,
+                                           device=results_device)
+            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+            predicted_class_logits = torch.zeros((data.shape[0], self.configuration_manager.num_img_classes), 
+                                                 dtype=torch.half, device=results_device)
+            if self.use_gaussian:
+                gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
+                                            value_scaling_factor=10,
+                                            device=results_device)
+            else:
+                gaussian = 1
+
+            if not self.allow_tqdm and self.verbose:
+                print(f'running prediction: {len(slicers)} steps')
+
+            with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
+                while True:
+                    item = queue.get()
+                    if item == 'end':
+                        queue.task_done()
+                        break
+                    workon, sl = item
+                    prediction, class_prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+                    print("class placeholder shape:", predicted_class_logits.shape,"class pred shape:", class_prediction.shape)
+                    print("predicted_class_logits[sl[0]].shape=", predicted_class_logits[sl[0]].shape)
+                    if self.use_gaussian:
+                        prediction *= gaussian
+                    predicted_logits[sl] += prediction
+                    n_predictions[sl[1:]] += gaussian
+                    predicted_class_logits[sl[0]] += class_prediction
+                    queue.task_done()
+                    pbar.update()
+            queue.join()
+
+            # predicted_logits /= n_predictions
+            torch.div(predicted_logits, n_predictions, out=predicted_logits)
+            # check for infs
+            if torch.any(torch.isinf(predicted_logits)):
+                raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
+                                   'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
+                                   'predicted_logits to fp32')
+        except Exception as e:
+            del predicted_logits, n_predictions, prediction, gaussian, workon
+            empty_cache(self.device)
+            empty_cache(results_device)
+            raise e
+        return predicted_logits, predicted_class_logits
+    
+
+    @torch.inference_mode()
+    def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
+            -> Union[np.ndarray, torch.Tensor]:
+        assert isinstance(input_image, torch.Tensor)
+        self.network = self.network.to(self.device)
+        self.network.eval()
+
+        empty_cache(self.device)
+
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck on some CPUs (no auto bfloat16 support detection)
+        # and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False
+        # is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            assert input_image.ndim == 4, 'input_image must be a 4D np.ndarray or torch.Tensor (c, x, y, z)'
+
+            if self.verbose:
+                print(f'Input shape: {input_image.shape}')
+                print("step_size:", self.tile_step_size)
+                print("mirror_axes:", self.allowed_mirroring_axes if self.use_mirroring else None)
+
+            # if input_image is smaller than tile_size we need to pad it to tile_size.
+            data, slicer_revert_padding = pad_nd_image(input_image, self.configuration_manager.patch_size,
+                                                       'constant', {'value': 0}, True,
+                                                       None)
+
+            slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
+
+            if self.perform_everything_on_device and self.device != 'cpu':
+                # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
+                try:
+                    predicted_logits, predicted_classes = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                           self.perform_everything_on_device)
+                except RuntimeError:
+                    print(
+                        'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
+                    empty_cache(self.device)
+                    predicted_logits, predicted_classes = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+            else:
+                predicted_logits, predicted_classes = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                       self.perform_everything_on_device)
+
+            empty_cache(self.device)
+            # revert padding
+            predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
+        return predicted_logits, predicted_classes
+
+def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, torch.Tensor], 
+                                  predicted_class_logits: Union[np.ndarray, torch.Tensor],
+                                  properties_dict: dict,
+                                  configuration_manager: ConfigurationManager,
+                                  plans_manager: PlansManager,
+                                  dataset_json_dict_or_file: Union[dict, str], output_file_truncated: str,
+                                  save_probabilities: bool = False,
+                                  num_threads_torch: int = default_num_processes):
+
+    if isinstance(dataset_json_dict_or_file, str):
+        dataset_json_dict_or_file = load_json(dataset_json_dict_or_file)
+
+    label_manager = plans_manager.get_label_manager(dataset_json_dict_or_file)
+    ret = convert_predicted_logits_to_segmentation_with_correct_shape(
+        predicted_array_or_file, plans_manager, configuration_manager, label_manager, properties_dict,
+        return_probabilities=save_probabilities, num_threads_torch=num_threads_torch
+    )
+    del predicted_array_or_file
+
+    # save
+    if save_probabilities:
+        segmentation_final, probabilities_final = ret
+        np.savez_compressed(output_file_truncated + '.npz', probabilities=probabilities_final)
+        save_pickle(properties_dict, output_file_truncated + '.pkl')
+        del probabilities_final, ret
+    else:
+        segmentation_final = ret
+        del ret
+    np.savez_compressed(output_file_truncated + '_class.npz', clas=predicted_class_logits)
+    rw = plans_manager.image_reader_writer_class()
+    rw.write_seg(segmentation_final, output_file_truncated + dataset_json_dict_or_file['file_ending'],
+                 properties_dict)
+
+
 
 class nnUNetDatasetCAS(nnUNetDatasetNumpy):
     """ Dataset for the Multitask nnUNet with CASeg functionality.
         Returns data, seg, seg_prev, properties, CLASS where seg_prev is the segmentation from the previous stage (or None).
         For loading preprocessed data + class labels.
     """
-    def __init__(self, folder: str, identifiers: List[str] = None,
+    def __init__(self, folder: str, rawfolder: str, identifiers: List[str] = None,
                  folder_with_segs_from_previous_stage: str = None):
         super().__init__(folder, identifiers, folder_with_segs_from_previous_stage)
-        self.class_labels = None 
-
-    def set_class_labels(self, rawfolder: str):
+        
         csv = pd.read_csv(join(rawfolder, 'class_labels.csv'))
         csv.set_index('case_id', inplace=True)
         class_dict = dict()
@@ -275,6 +483,74 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
     def initialize(self):
         # call parent initialize which will call our build_network_architecture above
         super().initialize()
+        self.dataset_class = nnUNetDatasetCAS
+
+    def get_dataloaders(self):
+        if self.dataset_class is None:
+            self.dataset_class = nnUNetDatasetCAS
+
+        patch_size = self.configuration_manager.patch_size
+        deep_supervision_scales = self._get_deep_supervision_scales()
+
+        (
+            rotation_for_DA,
+            do_dummy_2d_data_aug,
+            initial_patch_size,
+            mirror_axes,
+        ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+
+        # training pipeline
+        tr_transforms = self.get_training_transforms(
+            patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
+            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+            is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
+            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+            ignore_label=self.label_manager.ignore_label)
+
+        # validation pipeline
+        val_transforms = self.get_validation_transforms(deep_supervision_scales,
+                                                        is_cascaded=self.is_cascaded,
+                                                        foreground_labels=self.label_manager.foreground_labels,
+                                                        regions=self.label_manager.foreground_regions if
+                                                        self.label_manager.has_regions else None,
+                                                        ignore_label=self.label_manager.ignore_label)
+
+        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+
+        dl_tr = nnUNetDataLoaderCAS(dataset_tr, self.batch_size,
+                                 initial_patch_size,
+                                 self.configuration_manager.patch_size,
+                                 self.label_manager,
+                                 oversample_foreground_percent=self.oversample_foreground_percent,
+                                 sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
+                                 probabilistic_oversampling=self.probabilistic_oversampling)
+        dl_val = nnUNetDataLoaderCAS(dataset_val, self.batch_size,
+                                  self.configuration_manager.patch_size,
+                                  self.configuration_manager.patch_size,
+                                  self.label_manager,
+                                  oversample_foreground_percent=self.oversample_foreground_percent,
+                                  sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
+                                  probabilistic_oversampling=self.probabilistic_oversampling)
+
+        allowed_num_processes = get_allowed_n_proc_DA()
+        if allowed_num_processes == 0:
+            mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
+            mt_gen_val = SingleThreadedAugmenter(dl_val, None)
+        else:
+            mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
+                                                        num_processes=allowed_num_processes,
+                                                        num_cached=max(6, allowed_num_processes // 2), seeds=None,
+                                                        pin_memory=self.device.type == 'cuda', wait_time=0.002)
+            mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
+                                                      transform=None, num_processes=max(1, allowed_num_processes // 2),
+                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
+                                                      pin_memory=self.device.type == 'cuda',
+                                                      wait_time=0.002)
+        # # let's get this party started
+        _ = next(mt_gen_train)
+        _ = next(mt_gen_val)
+        return mt_gen_train, mt_gen_val
+
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -481,10 +757,180 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
             self.logger.plot_progress_png(self.output_folder)
 
         self.current_epoch += 1
+    
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        self.set_deep_supervision_enabled(False)
+        self.network.eval()
+
+        if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
+            self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
+                                   "encounter crashes in validation then this is because torch.compile forgets "
+                                   "to trigger a recompilation of the model with deep supervision disabled. "
+                                   "This causes torch.flip to complain about getting a tuple as input. Just rerun the "
+                                   "validation with --val (exactly the same as before) and then it will work. "
+                                   "Why? Because --val triggers nnU-Net to ONLY run validation meaning that the first "
+                                   "forward pass (where compile is triggered) already has deep supervision disabled. "
+                                   "This is exactly what we need in perform_actual_validation")
+
+        predictor = MynnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+                                    perform_everything_on_device=True, device=self.device, verbose=False,
+                                    verbose_preprocessing=False, allow_tqdm=False)
+        predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+                                        self.dataset_json, self.__class__.__name__,
+                                        self.inference_allowed_mirroring_axes)
+
+        with multiprocessing.get_context("spawn").Pool(default_num_processes) as segmentation_export_pool:
+            worker_list = [i for i in segmentation_export_pool._pool]
+            validation_output_folder = join(self.output_folder, 'validation')
+            maybe_mkdir_p(validation_output_folder)
+
+            # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
+            # the validation keys across the workers.
+            _, val_keys = self.do_split()
+            if self.is_ddp:
+                last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
+
+                val_keys = val_keys[self.local_rank:: dist.get_world_size()]
+                # we cannot just have barriers all over the place because the number of keys each GPU receives can be
+                # different
+
+            dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
+                                             folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+
+            next_stages = self.configuration_manager.next_stage_names
+
+            if next_stages is not None:
+                _ = [maybe_mkdir_p(join(self.output_folder_base, 'predicted_next_stage', n)) for n in next_stages]
+
+            results = []
+
+            for i, k in enumerate(dataset_val.identifiers):
+                proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
+                                                           allowed_num_queued=2)
+                while not proceed:
+                    sleep(0.1)
+                    proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
+                                                               allowed_num_queued=2)
+
+                self.print_to_log_file(f"predicting {k}")
+                data, _, seg_prev, properties, _ = dataset_val.load_case(k)
+
+                # we do [:] to convert blosc2 to numpy
+                data = data[:]
+
+                if self.is_cascaded:
+                    seg_prev = seg_prev[:]
+                    data = np.vstack((data, convert_labelmap_to_one_hot(seg_prev, self.label_manager.foreground_labels,
+                                                                        output_dtype=data.dtype)))
+                with warnings.catch_warnings():
+                    # ignore 'The given NumPy array is not writable' warning
+                    warnings.simplefilter("ignore")
+                    data = torch.from_numpy(data)
+
+                self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
+                output_filename_truncated = join(validation_output_folder, k)
+
+                prediction, class_prediction = predictor.predict_sliding_window_return_logits(data)
+                prediction = prediction.cpu()
+                class_prediction = class_prediction.cpu()
+
+                # this needs to go into background processes
+                results.append(
+                    segmentation_export_pool.starmap_async( #TODO export_prediciton_from _logits should save even class!
+                        export_prediction_from_logits, (
+                            (prediction, class_prediction, properties, self.configuration_manager, self.plans_manager,
+                             self.dataset_json, output_filename_truncated, save_probabilities),
+                        )
+                    )
+                )
+
+                # if needed, export the softmax prediction for the next stage
+                if next_stages is not None:
+                    for n in next_stages:
+                        next_stage_config_manager = self.plans_manager.get_configuration(n)
+                        expected_preprocessed_folder = join(nnUNet_preprocessed, self.plans_manager.dataset_name,
+                                                            next_stage_config_manager.data_identifier)
+                        # next stage may have a different dataset class, do not use self.dataset_class
+                        dataset_class = infer_dataset_class(expected_preprocessed_folder)
+
+                        try:
+                            # we do this so that we can use load_case and do not have to hard code how loading training cases is implemented
+                            tmp = dataset_class(expected_preprocessed_folder, [k])
+                            d, _, _, _ = tmp.load_case(k)
+                        except FileNotFoundError:
+                            self.print_to_log_file(
+                                f"Predicting next stage {n} failed for case {k} because the preprocessed file is missing! "
+                                f"Run the preprocessing for this configuration first!")
+                            continue
+
+                        target_shape = d.shape[1:]
+                        output_folder = join(self.output_folder_base, 'predicted_next_stage', n)
+                        output_file_truncated = join(output_folder, k)
+
+                        # resample_and_save(prediction, target_shape, output_file, self.plans_manager, self.configuration_manager, properties,
+                        #                   self.dataset_json)
+                        results.append(segmentation_export_pool.starmap_async(
+                            resample_and_save, (
+                                (prediction, target_shape, output_file_truncated, self.plans_manager,
+                                 self.configuration_manager,
+                                 properties,
+                                 self.dataset_json,
+                                 default_num_processes,
+                                 dataset_class),
+                            )
+                        ))
+                # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
+                if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
+                    dist.barrier()
+
+            _ = [r.get() for r in results]
+
+        if self.is_ddp:
+            dist.barrier()
+
+        if self.local_rank == 0:
+            #TODO addc ompute metrics for classification
+            metrics = compute_metrics_on_folder(join(self.preprocessed_dataset_folder_base, 'gt_segmentations'),
+                                                validation_output_folder,
+                                                join(validation_output_folder, 'summary.json'),
+                                                self.plans_manager.image_reader_writer_class(),
+                                                self.dataset_json["file_ending"],
+                                                self.label_manager.foreground_regions if self.label_manager.has_regions else
+                                                self.label_manager.foreground_labels,
+                                                self.label_manager.ignore_label, chill=True,
+                                                num_processes=default_num_processes * dist.get_world_size() if
+                                                self.is_ddp else default_num_processes)
+            classmetrics = compute_classification_metrics_on_folder(
+                join(self.preprocessed_dataset_folder_base, 'class_labels.csv'),
+                validation_output_folder,
+                self.dataset_json["file_ending"])
+            
+            self.print_to_log_file("Validation complete", also_print_to_console=True)
+            self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
+                                   also_print_to_console=True)
+            self.print_to_log_file("Mean classification accuracy: ", (classmetrics['classification_accuracy']),
+                                   also_print_to_console=True)
+
+        self.set_deep_supervision_enabled(True)
+        compute_gaussian.cache_clear()
+
+
+def compute_classification_metrics_on_folder(class_labels_csv, validation_output_folder, file_ending):
+    csv = pd.read_csv(class_labels_csv, index_col=0)
+    allfiles = [fl for fl in Path(validation_output_folder).glob(f'*.npz') if fl.name[:-4] in csv.index]
+    all_class_predictions = [np.argmax(np.load(fl)['clas']) for fl in allfiles]
+    #now compare output with GT.
+    gt_classes = [csv.loc[fl.name[:-4], 'class_label'] for fl in allfiles]
+    all_class_predictions = np.array(all_class_predictions)
+    gt_classes = np.array(gt_classes)
+
+    # Compute metrics
+    accuracy = np.mean(all_class_predictions == gt_classes)
+    return {"classification_accuracy": accuracy}
 
 
 #TODO:
 #other versions
-#training script to print losses separately byt backprop both
+#DONE training script to print losses separately but backprop both
 #inference script to output both segm and class, if it can thandle that as is
-#data loader to provide both segm and class labels
+#DONE data loader to provide both segm and class labels
