@@ -6,8 +6,9 @@ export nnUNet_results=/Users/evabreznik/Desktop/MAIASTUFF/nnunet_data/nnUNet_res
 # Move the trainer file to the nnUNetTrainer folder
 cp nnUNetTrainerMultitaskCAS.py ~/Desktop/KTH_CAS/MultitaskCASeg/nnUNet/training/nnUNetTrainer/variants/network_architecture/.
 
-# Plan and preprocess the data as usual
+# Plan and preprocess the data as usual, then copy the class labels in the same folder
 #nnUNetv2_plan_and_preprocess -t 666 --verify_dataset_integrity
+#cp $nnUNet_raw/Task666_ASOCA/class_labels.csv $nnUNet_preprocessed/Task666_ASOCA/.
 
 # Dont forget to add the classifier arguments into the json plans! 
 #this can be done with a function. I did it manually.

@@ -248,11 +248,11 @@ class nnUNetDatasetCAS(nnUNetDatasetNumpy):
         Returns data, seg, seg_prev, properties, CLASS where seg_prev is the segmentation from the previous stage (or None).
         For loading preprocessed data + class labels.
     """
-    def __init__(self, folder: str, rawfolder: str, identifiers: List[str] = None,
+    def __init__(self, folder: str, identifiers: List[str] = None,
                  folder_with_segs_from_previous_stage: str = None):
         super().__init__(folder, identifiers, folder_with_segs_from_previous_stage)
         
-        csv = pd.read_csv(join(rawfolder, 'class_labels.csv'))
+        csv = pd.read_csv(join(folder, 'class_labels.csv')) #assume the csv file has been copied into the preprocessed folder!
         csv.set_index('case_id', inplace=True)
         class_dict = dict()
         for idx, row in csv.iterrows():
@@ -416,7 +416,7 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.cls_loss_weight: float = 1.0
         self.seg_loss_weight: float = 1.0
-        #self.num_img_classes: int = 4  #number of classes for the classification head
+        #self.num_img_classes: int = 3  #number of classes for the classification head
         #self.aux_hidden: int = 32  #hidden dim for the aux classifier head
         #OBS: here we dont enable deep supervision for classification, since in nnunet deep 
         # supervision is only done in the decoder part...
@@ -444,7 +444,7 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
                                           deep_supervision=enable_deep_supervision)
 
         # they need to be added in the plans.json, since method is static and has no access to self
-        n_img_classes = arch_init_kwargs.get('n_img_classes', 4)
+        n_img_classes = arch_init_kwargs.get('n_img_classes', 3)
         aux_hidden = arch_init_kwargs.get('aux_hidden_dim', 32)
 
         wrapped = SegmentationWithImageClassifier(base_net, n_seg_classes=num_output_channels,
