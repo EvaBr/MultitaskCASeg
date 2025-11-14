@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import distributed as dist
 from torch import autocast
+from torch._dynamo import OptimizedModule
 from typing import Any, Tuple, List, Union
 import numpy as np
 import pandas as pd
@@ -24,18 +25,19 @@ from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
 from threadpoolctl import threadpool_limits
 
-from nnunet2.utilities.collate_outputs import collate_outputs
+from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 
+from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
-from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetNumpy, infer_dataset_class
-from nnunetv2.training.dataloading.nnunet_dataloader import nnUNetDataLoader
+from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetNumpy, nnUNetBaseDataset, infer_dataset_class
+from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 
 from batchgenerators.utilities.file_and_folder_operations import join, load_json, maybe_mkdir_p, save_pickle
 from nnunetv2.configuration import default_num_processes
@@ -113,7 +115,7 @@ class MynnUNetPredictor(nnUNetPredictor):
                                            dtype=torch.half,
                                            device=results_device)
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
-            predicted_class_logits = torch.zeros((data.shape[0], self.configuration_manager.num_img_classes), 
+            predicted_class_logits = torch.zeros((data.shape[0], self.plans_manager.plans["n_img_classes"]), 
                                                  dtype=torch.half, device=results_device)
             if self.use_gaussian:
                 gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
@@ -132,9 +134,10 @@ class MynnUNetPredictor(nnUNetPredictor):
                         queue.task_done()
                         break
                     workon, sl = item
-                    prediction, class_prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
-                    print("class placeholder shape:", predicted_class_logits.shape,"class pred shape:", class_prediction.shape)
-                    print("predicted_class_logits[sl[0]].shape=", predicted_class_logits[sl[0]].shape)
+                    prediction, class_prediction = self._internal_maybe_mirror_and_predict(workon)#[0].to(results_device)
+                    prediction = prediction[0].to(results_device)
+                    class_prediction = class_prediction.to(results_device)
+                    
                     if self.use_gaussian:
                         prediction *= gaussian
                     predicted_logits[sl] += prediction
@@ -252,7 +255,7 @@ class nnUNetDatasetCAS(nnUNetDatasetNumpy):
                  folder_with_segs_from_previous_stage: str = None):
         super().__init__(folder, identifiers, folder_with_segs_from_previous_stage)
         
-        csv = pd.read_csv(join(folder, 'class_labels.csv')) #assume the csv file has been copied into the preprocessed folder!
+        csv = pd.read_csv(join(nnUNet_preprocessed, 'class_labels.csv')) #assume the csv file has been copied into the preprocessed folder!
         csv.set_index('case_id', inplace=True)
         class_dict = dict()
         for idx, row in csv.iterrows():
@@ -261,7 +264,7 @@ class nnUNetDatasetCAS(nnUNetDatasetNumpy):
         #self.class_labels = np.load(join(rawfolder, 'class_labels.npy'), allow_pickle=True).item()
 
     def load_case(self, identifier):
-        data, seg, seg_prev, properties = super(nnUNetDatasetNumpy, self).load_case(identifier)
+        data, seg, seg_prev, properties = super(nnUNetDatasetCAS, self).load_case(identifier)
         class_label = self.class_labels[identifier]
         return data, seg, seg_prev, properties, class_label
 
@@ -269,12 +272,14 @@ class nnUNetDatasetCAS(nnUNetDatasetNumpy):
 
     @staticmethod
     def save_seg(
-            seg: Union[np.ndarray,List[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]], #check; is output for segm a number or a ndarray too?
+            seg: Union[np.ndarray,List[np.ndarray], Tuple[np.ndarray]], #check; is output for segm a number or a ndarray too?
             output_filename_truncated: str):
         if isinstance(seg, (list, tuple)):
             #we have also class output
             segm, class_logits = seg
-            np.savez_compressed(output_filename_truncated + '.npz', seg=segm, class_logits=class_logits)
+            np.savez_compressed(output_filename_truncated + '.npz', seg=segm)
+            #only splitting the saving into two files to be consistent with how its done in the export prediction function!
+            np.savez_compressed(output_filename_truncated + '_class.npz', clas=class_logits)
         else:
             np.savez_compressed(output_filename_truncated + '.npz', seg=seg)
 
@@ -313,7 +318,7 @@ class nnUNetDataLoaderCAS(nnUNetDataLoader):
             data_all = data_all[:, :, 0]
             seg_all = seg_all[:, :, 0]
 
-        class_all = torch.from_numpy(class_all).to(torch.int16)
+        class_all = torch.from_numpy(class_all).long()
         if self.transforms is not None:
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
@@ -361,17 +366,18 @@ class SegmentationWithImageClassifier(nn.Module):
       This avoids touching internal layers of base_net.
     """
 
-    def __init__(self, base_net: nn.Module, n_seg_classes: int, n_img_classes: int = 3, aux_hidden: int = 32):
+    def __init__(self, base_net: nn.Module, n_seg_classes: int, last_nr_feats: int, n_img_classes: int = 3, aux_hidden: int = 128):
         super().__init__()
         self.base = base_net
         self.n_seg_classes = n_seg_classes
         self.n_img_classes = n_img_classes
         self.aux_hidden = aux_hidden
 
+       # print("n_class", n_img_classes, "aux_hidden", aux_hidden, "last_nr_feats", last_nr_feats)
         # small FC to map pooled seg logits -> class logits
         # input dim for FC is n_seg_classes (we pool across spatial dims)
         self.cls_fc = nn.Sequential(
-            nn.Linear(base_net.num_features_per_stage[-1], aux_hidden),
+            nn.Linear(last_nr_feats, aux_hidden), #base_net.features_per_stage[-1]
             nn.ReLU(inplace=True),
             nn.Linear(aux_hidden, n_img_classes)
         )
@@ -391,9 +397,17 @@ class SegmentationWithImageClassifier(nn.Module):
         cls_logits = self.cls_fc(pooled)  # [B, n_img_classes]
         
         return seg_out, cls_logits
+    
 
+class SegmentationWithImageClassifier2(SegmentationWithImageClassifier):
+    def __init__(self, base_net: nn.Module, n_seg_classes: int, last_nr_feats: int, n_img_classes: int = 3, aux_hidden: int = 128):
+        super().__init__(base_net, n_seg_classes, last_nr_feats, n_img_classes, aux_hidden)
+        self.bottleneck_features = None
+        self._hook = self.base.decoder.stages[-1].register_forward_hook(self._save_bottleneck)
 
-class nnUNetTrainerMultiCASC(nnUNetTrainer):
+ 
+    
+class nnUNetTrainerMultiCAS_bottleneck(nnUNetTrainer):
     """
     Trainer subclass that builds the default architecture and wraps it with an auxiliary image classifier head.
     Expected data/targets:
@@ -416,11 +430,18 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.cls_loss_weight: float = 1.0
         self.seg_loss_weight: float = 1.0
-        #self.num_img_classes: int = 3  #number of classes for the classification head
-        #self.aux_hidden: int = 32  #hidden dim for the aux classifier head
+        #self.n_img_classes: int = 3  #number of classes for the classification head
+        #self.aux_hidden: int = 128  #hidden dim for the aux classifier head
         #OBS: here we dont enable deep supervision for classification, since in nnunet deep 
         # supervision is only done in the decoder part...
         #self.deep_supervision_class = False 
+        #update also logger keys:
+        self.logger.my_fantastic_logging['train_losses_cls'] = list()
+        self.logger.my_fantastic_logging['val_losses_cls'] = list()
+        self.logger.my_fantastic_logging['train_losses_seg'] = list()
+        self.logger.my_fantastic_logging['val_losses_seg'] = list()
+        self.num_epochs = 1000 #to be comparable with other trainings.
+        self.ce_class_weights = [1,0.5,2]  #weighting for classification CE loss, since CD very unbalanced
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
@@ -445,9 +466,11 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
 
         # they need to be added in the plans.json, since method is static and has no access to self
         n_img_classes = arch_init_kwargs.get('n_img_classes', 3)
-        aux_hidden = arch_init_kwargs.get('aux_hidden_dim', 32)
+        aux_hidden = arch_init_kwargs.get('aux_hidden_dim', 128)
+        last_nr_feats = arch_init_kwargs.get('features_per_stage', [100])[-1] #krneki default
 
         wrapped = SegmentationWithImageClassifier(base_net, n_seg_classes=num_output_channels,
+                                                  last_nr_feats=last_nr_feats,
                                                   n_img_classes=n_img_classes,
                                                   aux_hidden=aux_hidden)
         return wrapped
@@ -459,14 +482,15 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
         """
         # build segmentation loss exactly as parent does (it returns either a loss or DeepSupervisionWrapper etc.)
         loss_seg = super()._build_loss()
-        loss_cls = nn.CrossEntropyLoss()
+        loss_cls = RobustCrossEntropyLoss(weight=torch.tensor(self.ce_class_weights).to(self.device))
         #combined = CombinedSegAndClsLoss(seg_loss, cls_loss_weight=self.cls_loss_weight, seg_loss_weight=self.seg_loss_weight)
         
-        if self.enable_deep_supervision:
-                deep_supervision_scales = self._get_deep_supervision_scales()
-                weights_seg = np.array([1 / (2**i) for i in range(len(deep_supervision_scales))])
-                weights_seg[-1] = 1e-16  # don't use lowest resolution output
-                weights_seg = weights_seg / weights_seg.sum()
+        ##OBS the deep supervision wrapper is taken care of by the super._build_loss for segm!
+        #if self.enable_deep_supervision:
+        #        deep_supervision_scales = self._get_deep_supervision_scales()
+        #        weights_seg = np.array([1 / (2**i) for i in range(len(deep_supervision_scales))])
+        #        weights_seg[-1] = 1e-16  # don't use lowest resolution output
+        #        weights_seg = weights_seg / weights_seg.sum()
 
                 #if self.deep_supervision_class:
                 #    weights_cls = weights_seg.copy()
@@ -475,7 +499,7 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
                 #loss_cls = DeepSupervisionWrapper(loss_cls, weights_cls)
 
                 # now wrap the loss
-                loss_seg = DeepSupervisionWrapper(loss_seg, weights_seg)
+         #       loss_seg = DeepSupervisionWrapper(loss_seg, weights_seg)
 
         #return list of two, so you can plot and monitor them individually
         return lambda x,y: [self.seg_loss_weight * loss_seg(x[0], y[0]), self.cls_loss_weight * loss_cls(x[1], y[1])] 
@@ -562,8 +586,10 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
-
-        classes = classes.to(self.device, non_blocking=True)
+        if isinstance(classes, list):
+            classes = [i.to(self.device, non_blocking=True) for i in classes]
+        else:
+            classes = classes.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
@@ -571,8 +597,12 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
+            output = self.network(data) #[ [ deep supervison seg outputs, first one size S ], [B, n_img_classes] ]
             # del data
+            #target shape: [tensor(size S), tensor(2,)]
+        #    print("output type:", type(output))
+        #    print("len output", len(output), "len 0", len(output[0]),"shapes 0", [i.shape for i in output[0]], "shape 1", output[1].shape)
+        #    print("shape target", target[0].shape, "classes", classes.shape)
             losslist = self.loss(output, [target, classes])  # l is a list of two losses
             l = losslist[0] + losslist[1]  #combine for backprop
 
@@ -621,7 +651,10 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
-        classes = classes.to(self.device, non_blocking=True)
+        if isinstance(classes, list):
+            classes = [i.to(self.device, non_blocking=True) for i in classes]
+        else:
+            classes = classes.to(self.device, non_blocking=True)
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
@@ -901,7 +934,7 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
                                                 num_processes=default_num_processes * dist.get_world_size() if
                                                 self.is_ddp else default_num_processes)
             classmetrics = compute_classification_metrics_on_folder(
-                join(self.preprocessed_dataset_folder_base, 'class_labels.csv'),
+                join(nnUNet_preprocessed, 'class_labels.csv'),
                 validation_output_folder,
                 self.dataset_json["file_ending"])
             
@@ -914,10 +947,52 @@ class nnUNetTrainerMultiCASC(nnUNetTrainer):
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
 
+    def set_deep_supervision_enabled(self, enabled: bool):
+        """
+        This function is specific for the default architecture in nnU-Net. If you change the architecture, there are
+        chances you need to change this as well!
+        """
+        if self.is_ddp:
+            mod = self.network.module
+        else:
+            mod = self.network
+        if isinstance(mod, OptimizedModule):
+            mod = mod._orig_mod
+
+        mod.base.decoder.deep_supervision = enabled
+
+class nnUNetTrainerMultiCAS_penultimate(nnUNetTrainerMultiCAS_bottleneck):
+    """Same as _bottleneck but uses the penultimate layer features for classification head."""
+    def _build_network_architecture(architecture_class_name: str,
+                                   arch_init_kwargs: dict,
+                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                   num_input_channels: int,
+                                   num_output_channels: int,
+                                   enable_deep_supervision: bool = True) -> nn.Module:
+    
+        # build the original segmentation network (this uses the existing plans resolution)
+        base_net = get_network_from_plans(architecture_class_name,
+                                          arch_init_kwargs,
+                                          arch_init_kwargs_req_import,
+                                          num_input_channels,
+                                          num_output_channels,
+                                          allow_init=True,
+                                          deep_supervision=enable_deep_supervision)
+
+        # they need to be added in the plans.json, since method is static and has no access to self
+        n_img_classes = arch_init_kwargs.get('n_img_classes', 3)
+        aux_hidden = arch_init_kwargs.get('aux_hidden_dim', 128)
+        penultimate_nr_feats = arch_init_kwargs.get('features_per_stage', [100])[-2] #krneki default
+
+        wrapped = SegmentationWithImageClassifier2(base_net, n_seg_classes=num_output_channels,
+                                                  last_nr_feats=penultimate_nr_feats,
+                                                  n_img_classes=n_img_classes,
+                                                  aux_hidden=aux_hidden)
+        return wrapped
 
 def compute_classification_metrics_on_folder(class_labels_csv, validation_output_folder, file_ending):
     csv = pd.read_csv(class_labels_csv, index_col=0)
-    allfiles = [fl for fl in Path(validation_output_folder).glob(f'*.npz') if fl.name[:-4] in csv.index]
+    allfiles = [fl for fl in Path(validation_output_folder).glob(f'*_class.npz') if fl.name[:-10] in csv.index]
     all_class_predictions = [np.argmax(np.load(fl)['clas']) for fl in allfiles]
     #now compare output with GT.
     gt_classes = [csv.loc[fl.name[:-4], 'class_label'] for fl in allfiles]
